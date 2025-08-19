@@ -7,23 +7,23 @@ The developers are not financial advisors and accept no responsibility for any f
 Always consult a professional financial advisor before making any investment decisions.
 """
 
-from typing import Optional, List
+from typing import Optional, List, Tuple, Dict
 import time
 from json import JSONDecodeError
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
-from datetime import datetime, timedelta
 from scipy.interpolate import interp1d
 import altair as alt
-import requests
 from requests.exceptions import RequestException, Timeout, ConnectionError as ReqConnectionError
 
 st.set_page_config(page_title="Earnings Position Checker", page_icon="📈", layout="centered")
 
-# ============================ Core utilities ============================
+# ============================ Utilities ============================
 
 def badge(text: str, good: Optional[bool] = None) -> str:
     if good is True:
@@ -35,89 +35,54 @@ def badge(text: str, good: Optional[bool] = None) -> str:
     return f"<span style='background:{color};color:white;padding:2px 8px;border-radius:12px;font-size:0.85rem'>{text}</span>"
 
 def filter_dates(dates: List[str]) -> List[str]:
-    today = datetime.today().date()
+    today = datetime.now(timezone.utc).date()
     cutoff_date = today + timedelta(days=45)
-    sorted_dates = sorted(datetime.strptime(date, "%Y-%m-%d").date() for date in dates)
+    sorted_dates = sorted(datetime.strptime(d, "%Y-%m-%d").date() for d in dates)
 
-    arr = []
-    for i, date in enumerate(sorted_dates):
-        if date >= cutoff_date:
+    arr: List[str] = []
+    for i, dt in enumerate(sorted_dates):
+        if dt >= cutoff_date:
             arr = [d.strftime("%Y-%m-%d") for d in sorted_dates[:i+1]]
             break
 
-    if len(arr) > 0:
+    if arr:
         if arr[0] == today.strftime("%Y-%m-%d"):
             return arr[1:]
         return arr
-
     raise ValueError("No date 45 days or more in the future found.")
 
 def yang_zhang(price_data: pd.DataFrame, window=30, trading_periods=252, return_last_only=True):
-    # Expect price_data columns: Open, High, Low, Close
     log_ho = np.log(price_data['High'] / price_data['Open'])
     log_lo = np.log(price_data['Low'] / price_data['Open'])
     log_co = np.log(price_data['Close'] / price_data['Open'])
-
     log_oc = np.log(price_data['Open'] / price_data['Close'].shift(1))
-    log_oc_sq = log_oc**2
-
     log_cc = np.log(price_data['Close'] / price_data['Close'].shift(1))
-    log_cc_sq = log_cc**2
 
     rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
 
-    close_vol = log_cc_sq.rolling(window=window).sum() * (1.0 / (window - 1.0))
-    open_vol  = log_oc_sq.rolling(window=window).sum() * (1.0 / (window - 1.0))
-    window_rs = rs.rolling(window=window).sum() * (1.0 / (window - 1.0))
+    close_vol = (log_cc**2).rolling(window=window).sum() * (1.0 / (window - 1.0))
+    open_vol  = (log_oc**2).rolling(window=window).sum() * (1.0 / (window - 1.0))
+    window_rs = (rs**1).rolling(window=window).sum() * (1.0 / (window - 1.0))
 
     k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
     result = (open_vol + k * close_vol + (1 - k) * window_rs).apply(np.sqrt) * np.sqrt(trading_periods)
 
-    if return_last_only:
-        return result.dropna().iloc[-1]
-    else:
-        return result.dropna()
+    return result.dropna().iloc[-1] if return_last_only else result.dropna()
 
 def build_term_structure(days, ivs):
     days = np.array(days)
     ivs = np.array(ivs)
+    order = days.argsort()
+    spline = interp1d(days[order], ivs[order], kind='linear', fill_value="extrapolate")
 
-    sort_idx = days.argsort()
-    days = days[sort_idx]
-    ivs = ivs[sort_idx]
-
-    spline = interp1d(days, ivs, kind='linear', fill_value="extrapolate")
-
-    def term_spline(dte):
-        if dte < days[0]:
-            return float(ivs[0])
-        elif dte > days[-1]:
-            return float(ivs[-1])
-        else:
-            return float(spline(dte))
-
+    def term_spline(dte: float):
+        dte = float(dte)
+        if dte <= days[order][0]:  return float(ivs[order][0])
+        if dte >= days[order][-1]: return float(ivs[order][-1])
+        return float(spline(dte))
     return term_spline
 
-def get_current_price(ticker_obj: yf.Ticker) -> Optional[float]:
-    # Try attribute then mapping access; fall back to 1d history
-    try:
-        px = getattr(ticker_obj.fast_info, "last_price", None)
-        if px is None:
-            fi = ticker_obj.fast_info
-            try:
-                px = fi["last_price"]
-            except Exception:
-                px = None
-        if px and px > 0:
-            return float(px)
-    except Exception:
-        pass
-    todays = ticker_obj.history(period='1d', interval='1d', auto_adjust=False, prepost=False)
-    if len(todays) == 0:
-        return None
-    return float(todays['Close'].iloc[-1])
-
-# ============================ Session management (fixes JSONDecodeError) ============================
+# ============================ HTTP session helpers ============================
 
 def _new_session() -> requests.Session:
     s = requests.Session()
@@ -132,53 +97,85 @@ def _new_session() -> requests.Session:
 
 @st.cache_resource(ttl=900)
 def get_http_session() -> requests.Session:
-    """Cached HTTP session with browser-like headers."""
     return _new_session()
 
-# ---------- Robust Yahoo fetchers with retries ----------
+# ============================ Primary (yfinance) + Fallback (direct API) ============================
+
+def get_current_price_yf(t: yf.Ticker) -> Optional[float]:
+    try:
+        px = getattr(t.fast_info, "last_price", None)
+        if px is None:
+            fi = t.fast_info
+            try: px = fi["last_price"]
+            except Exception: px = None
+        if px and px > 0: return float(px)
+    except Exception:
+        pass
+    todays = t.history(period='1d', interval='1d', auto_adjust=False, prepost=False)
+    if len(todays) == 0: return None
+    return float(todays['Close'].iloc[-1])
 
 @st.cache_data(show_spinner=False, ttl=300)
-def fetch_expirations_and_price(ticker: str):
+def fetch_expirations_and_price(ticker: str) -> Tuple[str, List[str], Optional[float], Dict[str, int], Optional[str]]:
     """
-    Return (expirations, price, error_message). On failure, error_message is non-empty.
-    First try with a cached session; on errors (incl. JSONDecodeError), retry with a fresh session.
+    Returns (mode, expirations, price, exp_map_unix, error):
+      - mode: "yf" or "direct"
+      - expirations: list of "YYYY-MM-DD"
+      - price: underlying price
+      - exp_map_unix: for direct mode, map date->unix expiration (else {})
+      - error: message if both methods fail
     """
+    ticker = ticker.upper().replace(".", "-").strip()
+    session = get_http_session()
+
+    # -------- try yfinance first --------
     err = None
-    expirations, price = [], None
-
-    for attempt in range(4):
-        try:
-            session = get_http_session() if attempt == 0 else _new_session()
-            t = yf.Ticker(ticker, session=session)
-
-            expirations = list(t.options or [])
-            price = get_current_price(t)
-            if not expirations or price is None:
-                raise ValueError("Empty options or price")
-            err = None
-            break
-        except (JSONDecodeError, ReqConnectionError, Timeout, RequestException, ValueError) as e:
-            err = f"{type(e).__name__}: {e}"
-            time.sleep(0.8 * (attempt + 1))  # small backoff
-
-    return expirations, price, err
-
-def _safe_option_chain(stock: yf.Ticker, exp_date: str):
-    """
-    Try a few times to fetch an option chain for a given expiry.
-    Returns (chain, error_msg). chain has .calls and .puts or is None.
-    """
-    last_err = None
     for attempt in range(3):
         try:
-            ch = stock.option_chain(exp_date)
-            return ch, None
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            time.sleep(0.5 * (attempt + 1))
-    return None, last_err
+            t = yf.Ticker(ticker, session=session if attempt == 0 else _new_session())
+            expirations = list(t.options or [])
+            price = get_current_price_yf(t)
+            if expirations and price is not None:
+                return "yf", expirations, price, {}, None
+            raise ValueError("Empty options or price")
+        except (JSONDecodeError, ReqConnectionError, Timeout, RequestException, ValueError) as e:
+            err = f"{type(e).__name__}: {e}"
+            time.sleep(0.6 * (attempt + 1))
 
-# ---------- Main computation ----------
+    # -------- fallback: direct options API --------
+    # Get list of expirations + quote from base endpoint
+    base = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}"
+    exp_map_unix: Dict[str, int] = {}
+    for attempt in range(3):
+        try:
+            r = session.get(base, timeout=8)
+            data = r.json()
+            result = data["optionChain"]["result"][0]
+            exp_unix = result.get("expirationDates", [])
+            expirations = [datetime.utcfromtimestamp(u).strftime("%Y-%m-%d") for u in exp_unix]
+            exp_map_unix = {datetime.utcfromtimestamp(u).strftime("%Y-%m-%d"): int(u) for u in exp_unix}
+            q = result.get("quote", {}) or {}
+            price = q.get("regularMarketPrice") or q.get("postMarketPrice") or q.get("preMarketPrice")
+            if expirations and price:
+                return "direct", expirations, float(price), exp_map_unix, None
+            raise ValueError("No expirations/price in direct API")
+        except (JSONDecodeError, ReqConnectionError, Timeout, RequestException, ValueError, KeyError, IndexError) as e:
+            err = f"{type(e).__name__}: {e}"
+            time.sleep(0.6 * (attempt + 1))
+
+    return "error", [], None, {}, f"Yahoo data request failed. ({err})"
+
+def fetch_chain_direct(ticker: str, exp_unix: int, session: requests.Session) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (calls_df, puts_df) from the public options API."""
+    url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}?date={exp_unix}"
+    r = session.get(url, timeout=8)
+    data = r.json()
+    opt = data["optionChain"]["result"][0]["options"][0]
+    calls = pd.DataFrame(opt.get("calls", []))
+    puts  = pd.DataFrame(opt.get("puts",  []))
+    return calls, puts
+
+# ============================ Main computation ============================
 
 def compute_recommendation(ticker: str):
     try:
@@ -186,9 +183,9 @@ def compute_recommendation(ticker: str):
         if not ticker:
             return "No stock symbol provided."
 
-        expirations, underlying_price, yf_err = fetch_expirations_and_price(ticker)
-        if yf_err:
-            return f"Yahoo data request failed. Please try again shortly. ({yf_err})"
+        mode, expirations, underlying_price, exp_map_unix, err = fetch_expirations_and_price(ticker)
+        if err:
+            return err
         if not expirations:
             return f"Error: No options found for stock symbol '{ticker}'."
         if not underlying_price:
@@ -200,35 +197,58 @@ def compute_recommendation(ticker: str):
         except Exception:
             return "Error: Not enough option data."
 
-        # Use a session for all subsequent Yahoo calls
         session = get_http_session()
-        stock = yf.Ticker(ticker, session=session)
+        stock_yf = yf.Ticker(ticker, session=session) if mode == "yf" else None
 
-        atm_iv = {}
+        atm_iv: Dict[str, float] = {}
         straddle = None
         first_done = False
 
         for exp_date in exp_dates:
-            chain, _ = _safe_option_chain(stock, exp_date)
-            if chain is None:
+            # get options chain for this expiry
+            if mode == "yf":
+                # yfinance with retries
+                chain = None
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        chain = stock_yf.option_chain(exp_date)
+                        break
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(0.4 * (attempt + 1))
+                if chain is None:
+                    continue
+                calls = getattr(chain, "calls", pd.DataFrame())
+                puts  = getattr(chain, "puts",  pd.DataFrame())
+            else:
+                # direct API with unix timestamp
+                exp_unix = exp_map_unix.get(exp_date)
+                if not exp_unix:
+                    continue
+                try:
+                    calls, puts = fetch_chain_direct(ticker, exp_unix, session)
+                except Exception:
+                    continue
+
+            if calls.empty or puts.empty:
+                continue
+            if "strike" not in calls.columns or "strike" not in puts.columns:
                 continue
 
-            calls = getattr(chain, "calls", pd.DataFrame())
-            puts  = getattr(chain, "puts",  pd.DataFrame())
-            if calls.empty or puts.empty or "strike" not in calls or "strike" not in puts:
-                continue
-
-            # Pick nearest strike with non-NaN IV for each side
-            def _nearest_with_iv(df):
+            # nearest strikes with valid IVs
+            def nearest_with_iv(df: pd.DataFrame):
                 df2 = df.copy()
-                df2 = df2[pd.notna(df2.get("impliedVolatility"))]
+                if "impliedVolatility" not in df2.columns:
+                    return None
+                df2 = df2[pd.notna(df2["impliedVolatility"])]
                 if df2.empty:
                     return None
-                df2["dist"] = (df2["strike"] - underlying_price).abs()
+                df2["dist"] = (df2["strike"].astype(float) - float(underlying_price)).abs()
                 return df2.sort_values("dist").iloc[0]
 
-            call_row = _nearest_with_iv(calls)
-            put_row  = _nearest_with_iv(puts)
+            call_row = nearest_with_iv(calls)
+            put_row  = nearest_with_iv(puts)
             if call_row is None or put_row is None:
                 continue
 
@@ -237,44 +257,40 @@ def compute_recommendation(ticker: str):
             atm_iv_value = (call_iv + put_iv) / 2.0
             atm_iv[exp_date] = atm_iv_value
 
-            # Nearest expiry: compute straddle mid for expected move (if quotes exist)
+            # straddle mid on nearest expiry
             if not first_done:
-                def _mid(row, bid_col="bid", ask_col="ask"):
-                    b, a = row.get(bid_col), row.get(ask_col)
+                def mid(row):
+                    b = row.get("bid"); a = row.get("ask")
                     if pd.notna(b) and pd.notna(a):
                         return (float(b) + float(a)) / 2.0
                     return None
-                call_mid = _mid(call_row)
-                put_mid  = _mid(put_row)
-                if call_mid is not None and put_mid is not None:
-                    straddle = call_mid + put_mid
+                cm = mid(call_row); pm = mid(put_row)
+                if cm is not None and pm is not None:
+                    straddle = cm + pm
                 first_done = True
 
         if not atm_iv:
             return "Error: Could not determine ATM IV for any expiration dates."
 
-        today = datetime.today().date()
+        today = datetime.now(timezone.utc).date()
         dtes, ivs = [], []
         for exp_date, iv in atm_iv.items():
-            exp_date_obj = datetime.strptime(exp_date, "%Y-%m-%d").date()
-            days_to_expiry = (exp_date_obj - today).days
-            if days_to_expiry > 0:
-                dtes.append(days_to_expiry)
-                ivs.append(iv)
+            ed = datetime.strptime(exp_date, "%Y-%m-%d").date()
+            dte = (ed - today).days
+            if dte > 0:
+                dtes.append(dte); ivs.append(iv)
 
         if not dtes:
             return "Error: Unable to compute DTEs."
 
         term_spline = build_term_structure(dtes, ivs)
 
-        # slope between nearest DTE and 45 days
-        d0 = min(dtes)
-        d45 = 45
+        d0 = min(dtes); d45 = 45
         ts_slope_0_45 = 0.0 if d0 == d45 else (term_spline(d45) - term_spline(d0)) / (45 - d0)
 
-        # Historical prices (fetch longer, compute on latest slice)
-        px = stock.history(period='6mo', interval='1d', auto_adjust=True, prepost=False)
-        px = px.dropna(subset=['Open', 'High', 'Low', 'Close'])
+        # History: fetch longer, compute on latest 60 trading days
+        px = yf.Ticker(ticker, session=session).history(period='6mo', interval='1d', auto_adjust=True, prepost=False)
+        px = px.dropna(subset=['Open','High','Low','Close'])
         if len(px) < 35:
             return "Error: Not enough historical price data."
 
@@ -287,7 +303,6 @@ def compute_recommendation(ticker: str):
 
         iv30_rv30 = float(term_spline(30)) / yz_vol_annual
 
-        # Liquidity proxy
         try:
             avg_volume = px['Volume'].rolling(30).mean().dropna().iloc[-1]
         except Exception:
@@ -304,7 +319,6 @@ def compute_recommendation(ticker: str):
             'atm_iv_points': pd.DataFrame({'DTE': dtes, 'ATM_IV': ivs}).sort_values('DTE').reset_index(drop=True),
         }
     except Exception as e:
-        # Last-resort message with details so users aren't stuck with a generic error
         return f"Error occurred processing. ({type(e).__name__}: {e})"
 
 # ============================ UI ============================
@@ -325,7 +339,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.success("Cache cleared. Re-run the check.")
 
-ticker = st.text_input("Enter Stock Symbol", value="", placeholder="e.g., AAPL", help="US equity ticker with listed options")
+ticker = st.text_input("Enter Stock Symbol", value="", placeholder="e.g., AAPL")
 run = st.button("Run Check", type="primary")
 
 if run:
@@ -347,16 +361,13 @@ if run:
     price           = result['underlying_price']
     atm_df          = result['atm_iv_points']
 
-    # Overall verdict
+    # Verdict
     if avg_volume_bool and iv30_rv30_bool and ts_slope_bool:
-        title = "Recommended"
-        color = "#065f46"
-    elif ts_slope_bool and ((avg_volume_bool and not iv30_rv30_bool) or (iv30_rv30_bool and not avg_volume_bool)):
-        title = "Consider"
-        color = "#92400e"
+        title, color = "Recommended", "#065f46"
+    elif ts_slope_bool and (avg_volume_bool ^ iv30_rv30_bool):
+        title, color = "Consider", "#92400e"
     else:
-        title = "Avoid"
-        color = "#7f1d1d"
+        title, color = "Avoid", "#7f1d1d"
 
     st.markdown(f"<h3 style='color:{color};margin-top:0.5rem'>{title}</h3>", unsafe_allow_html=True)
     st.markdown(
@@ -365,54 +376,44 @@ if run:
         unsafe_allow_html=True,
     )
 
-    # Criteria table
-    rows = [
+    # Pass/Fail bullets
+    items = [
         ("avg_volume ≥ 1.5M (30-day avg)", avg_volume_bool),
         ("IV30 / RV30 ≥ 1.25", iv30_rv30_bool),
         ("Term slope (d0→45d) ≤ −0.00406", ts_slope_bool),
     ]
-    for label, ok in rows:
+    for label, ok in items:
         st.markdown(f"- {label}: {badge('PASS' if ok else 'FAIL', ok)}", unsafe_allow_html=True)
 
-    # ATM IV chart in %, with expected move overlay
-    if isinstance(atm_df, pd.DataFrame) and not atm_df.empty:
+    # Chart
+    if not atm_df.empty:
         st.subheader("ATM IV vs DTE")
-
         chart_df = atm_df.copy()
-        chart_df["ATM_IV_pct"] = chart_df["ATM_IV"] * 100  # convert to %
-
+        chart_df["ATM_IV_pct"] = chart_df["ATM_IV"] * 100
         base = (
             alt.Chart(chart_df)
             .mark_line(point=True)
             .encode(
                 x=alt.X("DTE:Q", title="Days to Expiration (DTE)"),
                 y=alt.Y("ATM_IV_pct:Q", title="ATM IV (%)"),
-                tooltip=[
-                    alt.Tooltip("DTE:Q", title="DTE"),
-                    alt.Tooltip("ATM_IV_pct:Q", title="ATM IV (%)", format=".2f")
-                ]
-            )
-            .properties(width=700, height=420)
+                tooltip=[alt.Tooltip("DTE:Q", title="DTE"),
+                         alt.Tooltip("ATM_IV_pct:Q", title="ATM IV (%)", format=".2f")]
+            ).properties(width=700, height=420)
         )
-
-        overlays = []
+        overlay = []
         title_suffix = ""
         if expected_move:
             try:
-                exp_val = float(expected_move.strip("%"))
-                overlays.append(
-                    alt.Chart(pd.DataFrame({"y": [exp_val]}))
-                    .mark_rule(strokeDash=[5, 5])
-                    .encode(y="y:Q")
+                overlay.append(
+                    alt.Chart(pd.DataFrame({"y": [float(expected_move.strip('%'))]}))
+                    .mark_rule(strokeDash=[5, 5]).encode(y="y:Q")
                 )
                 title_suffix = f"  —  Expected Move ≈ {expected_move}"
             except Exception:
                 pass
-
-        chart = alt.layer(base, *overlays).properties(
+        st.altair_chart(alt.layer(base, *overlay).properties(
             title=f"ATM Implied Volatility Term Structure{title_suffix}"
-        )
-        st.altair_chart(chart, use_container_width=True)
+        ), use_container_width=True)
 
         st.download_button("Download ATM IV points (CSV)",
                            chart_df[["DTE", "ATM_IV"]].to_csv(index=False),
@@ -424,7 +425,6 @@ if run:
         "- The slope check looks for a downward term structure from the nearest expiry to 45 days."
     )
 
-# ============================ Footer ============================
-
-st.caption("Data source: Yahoo Finance (via yfinance). Dates/vols are approximate and may be delayed.")
-st.caption("Created by Shashank Agarwal ")
+# Footer
+st.caption("Data source: Yahoo Finance (yfinance + direct options API). Data may be delayed.")
+st.caption("Created by Shashank Agarwal")
