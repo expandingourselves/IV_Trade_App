@@ -24,7 +24,7 @@ from requests.exceptions import RequestException, Timeout, ConnectionError as Re
 
 st.set_page_config(page_title="Earnings Position Checker", page_icon="📈", layout="centered")
 
-# ============================ Helpers & analytics ============================
+# ============================ Utilities & Analytics ============================
 
 def badge(text: str, good: Optional[bool] = None) -> str:
     if good is True:
@@ -83,7 +83,7 @@ def build_term_structure(days, ivs):
         return float(spline(dte))
     return term_spline
 
-# ============================ HTTP sessions ============================
+# ============================ HTTP Sessions ============================
 
 def _new_session() -> requests.Session:
     s = requests.Session()
@@ -102,7 +102,7 @@ def _new_session() -> requests.Session:
 def get_http_session() -> requests.Session:
     return _new_session()
 
-# ============================ Data fetch: yfinance → query2 → yahooquery ============================
+# ============================ Fetch: yfinance → query2 → yahooquery ============================
 
 def get_current_price_yf(t: yf.Ticker) -> Optional[float]:
     try:
@@ -169,17 +169,42 @@ def fetch_expirations_and_price(ticker: str) -> Tuple[str, List[str], Optional[f
             err = f"{type(e).__name__}: {e}"
             time.sleep(0.8 * (attempt + 1))
 
-    # 3) yahooquery (disable validate to avoid /v6/finance/quote/validate 429s)
+    # 3) yahooquery (validate=False) — tolerate missing option_expiration_dates
     try:
         yq = YQTicker(ticker, validate=False, formatted=False)
-        price_map = yq.price or {}
-        p = (price_map.get(ticker) or {}).get("regularMarketPrice")
-        exp_unix = (yq.option_expiration_dates or {}).get(ticker, [])
+
+        # price
+        p = None
+        try:
+            pm = yq.price or {}
+            p = (pm.get(ticker) or {}).get("regularMarketPrice")
+        except Exception:
+            p = None
+
+        # expirations: try attribute, else derive from option_chain()
+        exp_unix = []
+        try:
+            exp_attr = getattr(yq, "option_expiration_dates", None)
+            if isinstance(exp_attr, dict):
+                exp_unix = exp_attr.get(ticker, []) or []
+        except Exception:
+            pass
+
+        if not exp_unix:
+            try:
+                df_all = yq.option_chain()
+                if isinstance(df_all, pd.DataFrame) and not df_all.empty and "expirationDate" in df_all.columns:
+                    exp_unix = sorted({int(x) for x in df_all["expirationDate"].dropna().astype(int).tolist()})
+            except Exception:
+                pass
+
         expirations = [datetime.utcfromtimestamp(u).strftime("%Y-%m-%d") for u in exp_unix]
         exp_map_unix = {datetime.utcfromtimestamp(u).strftime("%Y-%m-%d"): int(u) for u in exp_unix}
+
         if expirations and p:
             st.session_state.setdefault("_yq_clients", {})[ticker] = yq  # reuse cookies for chains
             return "yq", expirations, float(p), exp_map_unix, None
+
         raise ValueError("yahooquery returned no expirations/price")
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
@@ -200,15 +225,30 @@ def fetch_chain_direct(ticker: str, exp_unix: int, session: requests.Session) ->
     return calls, puts
 
 def fetch_chain_yq(ticker: str, exp_unix: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Try option_chain(date=...), else pull all chains and filter by expirationDate.
+    """
     try:
         yq = st.session_state.get("_yq_clients", {}).get(ticker)
         if yq is None:
             yq = YQTicker(ticker, validate=False, formatted=False)
-        df = yq.option_chain(date=exp_unix)
+
+        df = None
+        try:
+            df = yq.option_chain(date=exp_unix)
+        except Exception:
+            try:
+                df_all = yq.option_chain()
+                if isinstance(df_all, pd.DataFrame) and not df_all.empty and "expirationDate" in df_all.columns:
+                    df = df_all[df_all["expirationDate"] == int(exp_unix)].copy()
+            except Exception:
+                df = None
+
         if not isinstance(df, pd.DataFrame) or df.empty:
             return pd.DataFrame(), pd.DataFrame()
         if "optionType" not in df.columns:
             return pd.DataFrame(), pd.DataFrame()
+
         calls = df[df["optionType"] == "calls"].copy()
         puts  = df[df["optionType"] == "puts"].copy()
         return calls, puts
