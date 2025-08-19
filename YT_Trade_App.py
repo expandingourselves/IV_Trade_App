@@ -403,10 +403,30 @@ def compute_recommendation(ticker: str):
 # ============================ UI ============================
 
 st.title("📈 Earnings Position Checker")
-st.markdown(
-    "[![Stocktwits Earnings Calendar](https://img.shields.io/badge/📅-Stocktwits_Earnings_Calendar-blue)](https://stocktwits.com/sentiment/calendar)",
-    unsafe_allow_html=True,
-)
+
+# Large Stocktwits button
+st.markdown("""
+<div style="text-align: center; margin: 20px 0;">
+    <a href="https://stocktwits.com/sentiment/calendar" target="_blank" style="text-decoration: none;">
+        <div style="
+            background: linear-gradient(135deg, #007bff 0%, #0056b3 100%);
+            color: white;
+            padding: 15px 30px;
+            border-radius: 12px;
+            font-size: 18px;
+            font-weight: bold;
+            display: inline-block;
+            box-shadow: 0 4px 12px rgba(0, 123, 255, 0.3);
+            transition: transform 0.2s ease;
+            border: none;
+            cursor: pointer;
+        " onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
+            📅 Stocktwits Earnings Calendar ↗
+        </div>
+    </a>
+</div>
+""", unsafe_allow_html=True)
+
 st.caption("Evaluates pre-earnings criteria using options term structure (ATM IV) and Yang–Zhang realized volatility.")
 
 # Instructions
@@ -613,19 +633,11 @@ if run:
     # Success message
     st.success(f"✅ Analysis completed for {ticker.upper()}")
 
+# Footer with creator credit
+st.markdown("---")
+st.markdown("**Created by Shashank Agarwal**")
+
 else:
     # Show example when not running
     st.markdown("---")
     st.markdown("**💡 Try these popular tickers:** `AAPL`, `MSFT`, `GOOGL`, `TSLA`, `AMZN`, `NVDA`")
-    
-    # Sample output preview
-    with st.expander("👀 Preview: Sample Analysis Results"):
-        st.image("https://via.placeholder.com/600x300/f0f0f0/666666?text=Sample+Volatility+Chart", caption="Example: ATM IV Term Structure")
-        
-        sample_df = pd.DataFrame({
-            "Criterion": ["Volume ≥ 1.5M", "IV/RV ≥ 1.25", "Term Slope ≤ -0.00406"],
-            "Status": ["✅ PASS", "✅ PASS", "❌ FAIL"],
-            "Value": ["2,450,000", "1.32", "0.00123"],
-            "Target": ["≥ 1,500,000", "≥ 1.25", "≤ -0.00406"]
-        })
-        st.dataframe(sample_df, use_container_width=True, hide_index=True)
