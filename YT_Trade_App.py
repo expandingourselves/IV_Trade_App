@@ -24,7 +24,7 @@ from requests.exceptions import RequestException, Timeout, ConnectionError as Re
 
 st.set_page_config(page_title="Earnings Position Checker", page_icon="📈", layout="centered")
 
-# ============================ Utilities ============================
+# ============================ Helpers & analytics ============================
 
 def badge(text: str, good: Optional[bool] = None) -> str:
     if good is True:
@@ -83,7 +83,7 @@ def build_term_structure(days, ivs):
         return float(spline(dte))
     return term_spline
 
-# ============================ HTTP session helpers ============================
+# ============================ HTTP sessions ============================
 
 def _new_session() -> requests.Session:
     s = requests.Session()
@@ -102,7 +102,7 @@ def _new_session() -> requests.Session:
 def get_http_session() -> requests.Session:
     return _new_session()
 
-# ============================ Primary (yfinance) + Fallbacks (direct API, yahooquery) ============================
+# ============================ Data fetch: yfinance → query2 → yahooquery ============================
 
 def get_current_price_yf(t: yf.Ticker) -> Optional[float]:
     try:
@@ -131,7 +131,7 @@ def fetch_expirations_and_price(ticker: str) -> Tuple[str, List[str], Optional[f
     ticker = ticker.upper().replace(".", "-").strip()
     session = get_http_session()
 
-    # --- try yfinance first ---
+    # 1) yfinance (cheapest)
     err = None
     for attempt in range(3):
         try:
@@ -145,14 +145,16 @@ def fetch_expirations_and_price(ticker: str) -> Tuple[str, List[str], Optional[f
             err = f"{type(e).__name__}: {e}"
             time.sleep(0.6 * (attempt + 1))
 
-    # --- fallback: direct options API ---
+    # 2) query2 finance API (no /validate)
     base = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}"
     exp_map_unix: Dict[str, int] = {}
     for attempt in range(3):
         try:
             r = session.get(base, timeout=8)
+            if r.status_code == 429:
+                raise ValueError("Rate-limited (429) on query2 base")
             if r.status_code != 200 or not r.text or not r.headers.get("content-type","").startswith("application/json"):
-                raise ValueError(f"Bad response ({r.status_code}): {r.text[:120]}")
+                raise ValueError(f"Bad response ({r.status_code})")
             data = r.json()
             result = data["optionChain"]["result"][0]
             exp_unix = result.get("expirationDates", [])
@@ -163,20 +165,20 @@ def fetch_expirations_and_price(ticker: str) -> Tuple[str, List[str], Optional[f
             if expirations and price:
                 return "direct", expirations, float(price), exp_map_unix, None
             raise ValueError("No expirations/price in direct API")
-        except (JSONDecodeError, ReqConnectionError, Timeout, RequestException, ValueError, KeyError, IndexError) as e:
+        except Exception as e:
             err = f"{type(e).__name__}: {e}"
-            time.sleep(0.6 * (attempt + 1))
+            time.sleep(0.8 * (attempt + 1))
 
-    # --- second fallback: yahooquery ---
+    # 3) yahooquery (disable validate to avoid /v6/finance/quote/validate 429s)
     try:
-        yq = YQTicker(ticker, validate=True, formatted=False)
+        yq = YQTicker(ticker, validate=False, formatted=False)
         price_map = yq.price or {}
         p = (price_map.get(ticker) or {}).get("regularMarketPrice")
         exp_unix = (yq.option_expiration_dates or {}).get(ticker, [])
         expirations = [datetime.utcfromtimestamp(u).strftime("%Y-%m-%d") for u in exp_unix]
         exp_map_unix = {datetime.utcfromtimestamp(u).strftime("%Y-%m-%d"): int(u) for u in exp_unix}
         if expirations and p:
-            st.session_state.setdefault("_yq_clients", {})[ticker] = yq  # keep for chains
+            st.session_state.setdefault("_yq_clients", {})[ticker] = yq  # reuse cookies for chains
             return "yq", expirations, float(p), exp_map_unix, None
         raise ValueError("yahooquery returned no expirations/price")
     except Exception as e:
@@ -187,6 +189,8 @@ def fetch_expirations_and_price(ticker: str) -> Tuple[str, List[str], Optional[f
 def fetch_chain_direct(ticker: str, exp_unix: int, session: requests.Session) -> Tuple[pd.DataFrame, pd.DataFrame]:
     url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}?date={exp_unix}"
     r = session.get(url, timeout=8)
+    if r.status_code == 429:
+        raise ValueError("Rate-limited (429) on query2 chain")
     if r.status_code != 200 or not r.headers.get("content-type","").startswith("application/json"):
         raise ValueError(f"Bad chain response ({r.status_code})")
     data = r.json()
@@ -196,15 +200,20 @@ def fetch_chain_direct(ticker: str, exp_unix: int, session: requests.Session) ->
     return calls, puts
 
 def fetch_chain_yq(ticker: str, exp_unix: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    yq = st.session_state.get("_yq_clients", {}).get(ticker) or YQTicker(ticker, formatted=False)
-    df = yq.option_chain(date=exp_unix)
-    if not isinstance(df, pd.DataFrame) or df.empty:
+    try:
+        yq = st.session_state.get("_yq_clients", {}).get(ticker)
+        if yq is None:
+            yq = YQTicker(ticker, validate=False, formatted=False)
+        df = yq.option_chain(date=exp_unix)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        if "optionType" not in df.columns:
+            return pd.DataFrame(), pd.DataFrame()
+        calls = df[df["optionType"] == "calls"].copy()
+        puts  = df[df["optionType"] == "puts"].copy()
+        return calls, puts
+    except Exception:
         return pd.DataFrame(), pd.DataFrame()
-    if "optionType" not in df.columns:  # older yq can return multiindex
-        return pd.DataFrame(), pd.DataFrame()
-    calls = df[df["optionType"] == "calls"].copy()
-    puts  = df[df["optionType"] == "puts"].copy()
-    return calls, puts
 
 # ============================ Main computation ============================
 
@@ -222,7 +231,7 @@ def compute_recommendation(ticker: str):
         if not underlying_price:
             return "Error: Unable to retrieve underlying stock price."
 
-        # Choose expiries (nearest → ≥45d window)
+        # Choose expiries (nearest → include >=45d)
         try:
             exp_dates = filter_dates(expirations)
         except Exception:
@@ -236,7 +245,7 @@ def compute_recommendation(ticker: str):
         first_done = False
 
         for exp_date in exp_dates:
-            # get options chain for this expiry
+            # fetch chain
             if mode == "yf":
                 chain = None
                 for attempt in range(3):
@@ -256,7 +265,7 @@ def compute_recommendation(ticker: str):
                     calls, puts = fetch_chain_direct(ticker, exp_unix, session)
                 except Exception:
                     continue
-            else:  # "yq"
+            else:  # yq
                 exp_unix = exp_map_unix.get(exp_date)
                 if not exp_unix: continue
                 calls, puts = fetch_chain_yq(ticker, exp_unix)
@@ -266,7 +275,7 @@ def compute_recommendation(ticker: str):
             if "strike" not in calls.columns or "strike" not in puts.columns:
                 continue
 
-            # nearest strikes with valid IVs
+            # nearest with valid IV
             def nearest_with_iv(df: pd.DataFrame):
                 if "impliedVolatility" not in df.columns:
                     return None
@@ -286,7 +295,7 @@ def compute_recommendation(ticker: str):
             atm_iv_value = (call_iv + put_iv) / 2.0
             atm_iv[exp_date] = atm_iv_value
 
-            # straddle mid on nearest expiry
+            # straddle mid on first expiry
             if not first_done:
                 def mid(row):
                     b = row.get("bid"); a = row.get("ask")
@@ -316,7 +325,7 @@ def compute_recommendation(ticker: str):
         d0 = min(dtes); d45 = 45
         ts_slope_0_45 = 0.0 if d0 == d45 else (term_spline(d45) - term_spline(d0)) / (45 - d0)
 
-        # History: fetch longer, compute on latest 60 trading days
+        # History: compute YZ on latest ~60 trading days (fetch 6mo for safety)
         px = yf.Ticker(ticker, session=get_http_session()).history(period='6mo', interval='1d', auto_adjust=True, prepost=False)
         px = px.dropna(subset=['Open','High','Low','Close'])
         if len(px) < 35:
@@ -386,6 +395,7 @@ if run:
     price           = result['underlying_price']
     atm_df          = result['atm_iv_points']
 
+    # Verdict
     if avg_volume_bool and iv30_rv30_bool and ts_slope_bool:
         title, color = "Recommended", "#065f46"
     elif ts_slope_bool and (avg_volume_bool ^ iv30_rv30_bool):
@@ -400,6 +410,7 @@ if run:
         unsafe_allow_html=True,
     )
 
+    # Criteria bullets
     for label, ok in [
         ("avg_volume ≥ 1.5M (30-day avg)", avg_volume_bool),
         ("IV30 / RV30 ≥ 1.25", iv30_rv30_bool),
@@ -407,6 +418,7 @@ if run:
     ]:
         st.markdown(f"- {label}: {badge('PASS' if ok else 'FAIL', ok)}", unsafe_allow_html=True)
 
+    # Chart
     if not atm_df.empty:
         st.subheader("ATM IV vs DTE")
         chart_df = atm_df.copy()
@@ -444,5 +456,6 @@ if run:
         "- The slope check looks for a downward term structure from the nearest expiry to 45 days."
     )
 
+# Footer
 st.caption("Data source: Yahoo Finance (yfinance / query2 API / yahooquery). Data may be delayed.")
 st.caption("Created by Shashank Agarwal")
