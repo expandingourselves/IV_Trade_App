@@ -7,455 +7,625 @@ The developers are not financial advisors and accept no responsibility for any f
 Always consult a professional financial advisor before making any investment decisions.
 """
 
-from typing import Optional, List, Tuple, Dict
-import time, random
-from json import JSONDecodeError
-from datetime import datetime, timedelta, timezone
-
-import numpy as np
-import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
 from scipy.interpolate import interp1d
+from typing import Optional, List, Dict, Any
 import altair as alt
-from yahooquery import Ticker as YQTicker
-from requests.exceptions import RequestException, Timeout, ConnectionError as ReqConnectionError
+import time
 
-st.set_page_config(page_title="Earnings Position Checker", page_icon="📈", layout="centered")
+# Configure Streamlit page
+st.set_page_config(
+    page_title="Earnings Position Checker", 
+    page_icon="📈", 
+    layout="centered",
+    initial_sidebar_state="collapsed"
+)
 
-# ============================ Small helpers ============================
+# ============================ Core utilities ============================
 
 def badge(text: str, good: Optional[bool] = None) -> str:
-    color = "#2563eb"
-    if good is True: color = "#16a34a"
-    elif good is False: color = "#b91c1c"
+    """Create colored badge for display"""
+    if good is True:
+        color = "#16a34a"  # green
+    elif good is False:
+        color = "#b91c1c"  # red
+    else:
+        color = "#2563eb"  # blue (neutral)
     return f"<span style='background:{color};color:white;padding:2px 8px;border-radius:12px;font-size:0.85rem'>{text}</span>"
 
 def filter_dates(dates: List[str]) -> List[str]:
-    today = datetime.now(timezone.utc).date()
+    """Filter dates to find appropriate expiration dates"""
+    today = datetime.today().date()
     cutoff_date = today + timedelta(days=45)
-    sorted_dates = sorted(datetime.strptime(d, "%Y-%m-%d").date() for d in dates)
+    sorted_dates = sorted(datetime.strptime(date, "%Y-%m-%d").date() for date in dates)
 
-    out: List[str] = []
-    for i, dt in enumerate(sorted_dates):
-        if dt >= cutoff_date:
-            out = [d.strftime("%Y-%m-%d") for d in sorted_dates[:i+1]]
+    arr = []
+    for i, date in enumerate(sorted_dates):
+        if date >= cutoff_date:
+            arr = [d.strftime("%Y-%m-%d") for d in sorted_dates[:i+1]]
             break
-    if out:
-        if out[0] == today.strftime("%Y-%m-%d"):
-            return out[1:]
-        return out
+
+    if len(arr) > 0:
+        if arr[0] == today.strftime("%Y-%m-%d"):
+            return arr[1:]
+        return arr
+
     raise ValueError("No date 45 days or more in the future found.")
 
 def yang_zhang(price_data: pd.DataFrame, window=30, trading_periods=252, return_last_only=True):
-    log_ho = np.log(price_data['High'] / price_data['Open'])
-    log_lo = np.log(price_data['Low'] / price_data['Open'])
-    log_co = np.log(price_data['Close'] / price_data['Open'])
-    log_oc = np.log(price_data['Open'] / price_data['Close'].shift(1))
-    log_cc = np.log(price_data['Close'] / price_data['Close'].shift(1))
+    """Calculate Yang-Zhang volatility estimator"""
+    try:
+        # Ensure we have required columns
+        required_cols = ['Open', 'High', 'Low', 'Close']
+        if not all(col in price_data.columns for col in required_cols):
+            raise ValueError(f"Missing required columns. Need: {required_cols}")
+        
+        # Remove any rows with NaN values
+        price_data = price_data[required_cols].dropna()
+        
+        if len(price_data) < window + 1:
+            raise ValueError(f"Insufficient data: need at least {window + 1} rows, got {len(price_data)}")
+        
+        log_ho = np.log(price_data['High'] / price_data['Open'])
+        log_lo = np.log(price_data['Low'] / price_data['Open'])
+        log_co = np.log(price_data['Close'] / price_data['Open'])
 
-    rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+        log_oc = np.log(price_data['Open'] / price_data['Close'].shift(1))
+        log_oc_sq = log_oc**2
 
-    close_vol = (log_cc**2).rolling(window=window).sum() * (1.0 / (window - 1.0))
-    open_vol  = (log_oc**2).rolling(window=window).sum() * (1.0 / (window - 1.0))
-    window_rs = (rs**1).rolling(window=window).sum() * (1.0 / (window - 1.0))
+        log_cc = np.log(price_data['Close'] / price_data['Close'].shift(1))
+        log_cc_sq = log_cc**2
 
-    k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
-    result = (open_vol + k * close_vol + (1 - k) * window_rs).apply(np.sqrt) * np.sqrt(trading_periods)
-    return result.dropna().iloc[-1] if return_last_only else result.dropna()
+        rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+
+        close_vol = log_cc_sq.rolling(window=window).sum() * (1.0 / (window - 1.0))
+        open_vol = log_oc_sq.rolling(window=window).sum() * (1.0 / (window - 1.0))
+        window_rs = rs.rolling(window=window).sum() * (1.0 / (window - 1.0))
+
+        k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
+        result = (open_vol + k * close_vol + (1 - k) * window_rs).apply(np.sqrt) * np.sqrt(trading_periods)
+
+        result_clean = result.dropna()
+        if len(result_clean) == 0:
+            raise ValueError("No valid Yang-Zhang volatility values computed")
+            
+        if return_last_only:
+            return float(result_clean.iloc[-1])
+        else:
+            return result_clean
+    except Exception as e:
+        raise ValueError(f"Yang-Zhang calculation failed: {str(e)}")
 
 def build_term_structure(days, ivs):
-    days = np.array(days); ivs = np.array(ivs)
-    order = days.argsort()
-    spline = interp1d(days[order], ivs[order], kind='linear', fill_value="extrapolate")
-    def term_spline(dte: float):
-        dte = float(dte)
-        if dte <= days[order][0]:  return float(ivs[order][0])
-        if dte >= days[order][-1]: return float(ivs[order][-1])
-        return float(spline(dte))
+    """Build volatility term structure interpolator"""
+    days = np.array(days)
+    ivs = np.array(ivs)
+
+    sort_idx = days.argsort()
+    days = days[sort_idx]
+    ivs = ivs[sort_idx]
+
+    # Use cubic if we have enough points, otherwise linear
+    kind = 'cubic' if len(days) >= 4 else 'linear'
+    spline = interp1d(days, ivs, kind=kind, fill_value="extrapolate")
+
+    def term_spline(dte):
+        if dte < days[0]:
+            return float(ivs[0])
+        elif dte > days[-1]:
+            return float(ivs[-1])
+        else:
+            return float(spline(dte))
+
     return term_spline
 
-def _new_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-        "Referer": "https://finance.yahoo.com/",
-    })
-    return s
-
-@st.cache_resource(ttl=900)
-def get_http_session() -> requests.Session:
-    return _new_session()
-
-def _epoch_from_date_str(date_str: str) -> int:
-    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc, hour=0, minute=0, second=0, microsecond=0)
-    return int(dt.timestamp())
-
-# ============================ Robust data getters (price & expirations split) ============================
+def get_current_price(ticker_obj: yf.Ticker) -> Optional[float]:
+    """Get current stock price with multiple fallback methods"""
+    try:
+        # Method 1: Fast info
+        try:
+            info = ticker_obj.fast_info
+            if hasattr(info, 'last_price') and info.last_price:
+                return float(info.last_price)
+            if isinstance(info, dict) and 'last_price' in info and info['last_price']:
+                return float(info['last_price'])
+        except:
+            pass
+        
+        # Method 2: Today's history
+        try:
+            today_data = ticker_obj.history(period='1d', interval='1m')
+            if not today_data.empty:
+                return float(today_data['Close'].iloc[-1])
+        except:
+            pass
+            
+        # Method 3: Recent history
+        try:
+            recent_data = ticker_obj.history(period='5d')
+            if not recent_data.empty:
+                return float(recent_data['Close'].iloc[-1])
+        except:
+            pass
+            
+        # Method 4: Info dict
+        try:
+            info = ticker_obj.info
+            if 'currentPrice' in info and info['currentPrice']:
+                return float(info['currentPrice'])
+            if 'regularMarketPrice' in info and info['regularMarketPrice']:
+                return float(info['regularMarketPrice'])
+        except:
+            pass
+            
+        return None
+        
+    except Exception:
+        return None
 
 @st.cache_data(show_spinner=False, ttl=300)
-def get_price_any(ticker: str) -> Tuple[Optional[float], Optional[str]]:
-    ticker = ticker.upper().replace(".", "-").strip()
-    sess = get_http_session()
-
-    # yfinance
-    for i in range(3):
+def fetch_ticker_data(ticker: str) -> Dict[str, Any]:
+    """Fetch and cache ticker data"""
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        
+        # Get expirations with timeout
+        expirations = []
         try:
-            t = yf.Ticker(ticker, session=sess if i == 0 else _new_session())
-            px = getattr(t.fast_info, "last_price", None)
-            if px is None:
-                fi = t.fast_info
-                try: px = fi["last_price"]
-                except Exception: px = None
-            if px and px > 0:
-                return float(px), "yf.fast_info"
-            todays = t.history(period="1d", interval="1d", auto_adjust=False, prepost=False)
-            if not todays.empty:
-                return float(todays["Close"].iloc[-1]), "yf.history"
-        except (JSONDecodeError, ReqConnectionError, Timeout, RequestException):
-            time.sleep(0.4 + 0.4 * i + random.random()*0.3)
-
-    # direct quote
-    try:
-        r = sess.get(
-            "https://query2.finance.yahoo.com/v6/finance/quote",
-            params={"symbols": ticker, "lang":"en-US", "region":"US"},
-            timeout=8,
-        )
-        if r.status_code == 200 and r.headers.get("content-type","").startswith("application/json"):
-            data = r.json()
-            res = (data.get("quoteResponse", {}) or {}).get("result", [])
-            if res:
-                px = res[0].get("regularMarketPrice") or res[0].get("postMarketPrice") or res[0].get("preMarketPrice")
-                if px:
-                    return float(px), "direct.quote"
-    except Exception:
-        pass
-
-    # yahooquery
-    try:
-        yq = YQTicker(ticker, validate=False, formatted=False)
-        pm = yq.price or {}
-        p = (pm.get(ticker) or {}).get("regularMarketPrice")
-        if p:
-            return float(p), "yq.price"
-    except Exception:
-        pass
-
-    return None, None
+            expirations = list(ticker_obj.options or [])
+        except Exception:
+            pass
+        
+        # Get current price
+        price = get_current_price(ticker_obj)
+        
+        # Get historical data
+        hist_data = None
+        try:
+            hist_data = ticker_obj.history(period='6mo')  # Increased period for better data
+            if hist_data.empty:
+                hist_data = ticker_obj.history(period='3mo')
+        except Exception:
+            pass
+            
+        return {
+            'expirations': expirations,
+            'price': price,
+            'history': hist_data
+        }
+        
+    except Exception as e:
+        return {
+            'expirations': [],
+            'price': None,
+            'history': None,
+            'error': str(e)
+        }
 
 @st.cache_data(show_spinner=False, ttl=300)
-def get_expirations_any(ticker: str) -> Tuple[List[str], Dict[str,int], Optional[str]]:
-    """
-    Returns (expirations_yyyy_mm_dd, date_to_unix_map, source)
-    """
-    ticker = ticker.upper().replace(".", "-").strip()
-    sess = get_http_session()
-
-    # yfinance
-    for i in range(3):
-        try:
-            t = yf.Ticker(ticker, session=sess if i == 0 else _new_session())
-            opts = list(t.options or [])
-            if opts:
-                return opts, {}, "yf.options"
-        except (JSONDecodeError, ReqConnectionError, Timeout, RequestException):
-            time.sleep(0.4 + 0.4 * i + random.random()*0.3)
-
-    # direct options root (gives expirationDates as unix)
+def fetch_options_chain(ticker: str, exp_date: str) -> Dict[str, Any]:
+    """Fetch and cache options chain for a specific expiration"""
     try:
-        r = sess.get(f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}", timeout=8)
-        if r.status_code == 200 and r.headers.get("content-type","").startswith("application/json"):
-            data = r.json()
-            result = data["optionChain"]["result"][0]
-            exp_unix = result.get("expirationDates", []) or []
-            if exp_unix:
-                dates = [datetime.utcfromtimestamp(u).strftime("%Y-%m-%d") for u in exp_unix]
-                exp_map = {datetime.utcfromtimestamp(u).strftime("%Y-%m-%d"): int(u) for u in exp_unix}
-                return dates, exp_map, "direct.root"
-    except Exception:
-        pass
-
-    # yahooquery: attribute or derive from option_chain
-    try:
-        yq = YQTicker(ticker, validate=False, formatted=False)
-        exp_unix = []
-        try:
-            exp_attr = getattr(yq, "option_expiration_dates", None)
-            if isinstance(exp_attr, dict):
-                exp_unix = exp_attr.get(ticker, []) or []
-        except Exception:
-            exp_unix = []
-
-        if not exp_unix:
-            # derive from option_chain
-            df_all = yq.option_chain()
-            if isinstance(df_all, pd.DataFrame) and not df_all.empty and "expirationDate" in df_all.columns:
-                exp_unix = sorted({int(x) for x in df_all["expirationDate"].dropna().astype(int).tolist()})
-
-        if exp_unix:
-            dates = [datetime.utcfromtimestamp(u).strftime("%Y-%m-%d") for u in exp_unix]
-            exp_map = {datetime.utcfromtimestamp(u).strftime("%Y-%m-%d"): int(u) for u in exp_unix}
-            # cache client for later chains
-            st.session_state.setdefault("_yq_clients", {})[ticker] = yq
-            return dates, exp_map, "yq"
-    except Exception:
-        pass
-
-    return [], {}, None
-
-# ============================ Chain fetchers ============================
-
-def fetch_chain_yf(ticker: str, exp_date: str, sess: requests.Session) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    t = yf.Ticker(ticker, session=sess)
-    ch = t.option_chain(exp_date)
-    return getattr(ch, "calls", pd.DataFrame()), getattr(ch, "puts", pd.DataFrame())
-
-def fetch_chain_direct(ticker: str, exp_unix: int, sess: requests.Session) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    r = sess.get(f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}", params={"date": exp_unix}, timeout=8)
-    if r.status_code != 200 or not r.headers.get("content-type","").startswith("application/json"):
-        raise ValueError(f"bad status {r.status_code}")
-    data = r.json()
-    opt = data["optionChain"]["result"][0]["options"][0]
-    return pd.DataFrame(opt.get("calls", [])), pd.DataFrame(opt.get("puts", []))
-
-def fetch_chain_yq(ticker: str, exp_unix: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    yq = st.session_state.get("_yq_clients", {}).get(ticker) or YQTicker(ticker, validate=False, formatted=False)
-    df = None
-    try:
-        df = yq.option_chain(date=exp_unix)
-    except Exception:
-        # derive by filtering all
-        try:
-            df_all = yq.option_chain()
-            if isinstance(df_all, pd.DataFrame) and not df_all.empty and "expirationDate" in df_all.columns:
-                df = df_all[df_all["expirationDate"] == int(exp_unix)].copy()
-        except Exception:
-            df = None
-    if not isinstance(df, pd.DataFrame) or df.empty or "optionType" not in df.columns:
-        return pd.DataFrame(), pd.DataFrame()
-    return df[df["optionType"] == "calls"].copy(), df[df["optionType"] == "puts"].copy()
-
-# ============================ Main computation ============================
+        ticker_obj = yf.Ticker(ticker)
+        chain = ticker_obj.option_chain(exp_date)
+        
+        calls = getattr(chain, 'calls', pd.DataFrame())
+        puts = getattr(chain, 'puts', pd.DataFrame())
+        
+        return {
+            'calls': calls,
+            'puts': puts,
+            'success': True
+        }
+    except Exception as e:
+        return {
+            'calls': pd.DataFrame(),
+            'puts': pd.DataFrame(), 
+            'success': False,
+            'error': str(e)
+        }
 
 def compute_recommendation(ticker: str):
+    """Main computation function with improved error handling"""
     try:
-        t = ticker.strip().upper().replace(".", "-")
-        if not t:
+        ticker = ticker.strip().upper()
+        if not ticker:
             return "No stock symbol provided."
 
-        # Get price and expirations independently
-        price, price_src = get_price_any(t)
-        exps, exp_map_unix, exp_src = get_expirations_any(t)
+        # Fetch basic ticker data
+        ticker_data = fetch_ticker_data(ticker)
+        
+        if 'error' in ticker_data:
+            return f"Error fetching data for {ticker}: {ticker_data['error']}"
+            
+        expirations = ticker_data['expirations']
+        underlying_price = ticker_data['price']
+        price_history = ticker_data['history']
+        
+        if not expirations:
+            return f"No options found for {ticker}. Verify the ticker symbol."
+        
+        if not underlying_price or underlying_price <= 0:
+            return f"Unable to retrieve current price for {ticker}."
+            
+        if price_history is None or price_history.empty:
+            return f"Unable to retrieve price history for {ticker}."
 
-        if not exps:
-            return "Yahoo data request failed. (No expirations found; providers rate-limited / unavailable)"
-        if not price:
-            return "Yahoo data request failed. (No price found; providers rate-limited / unavailable)"
-
-        # pick expiries (nearest .. include >=45d)
+        # Filter expiration dates
         try:
-            exp_dates = filter_dates(exps)
-        except Exception:
-            return "Error: Not enough option data."
+            exp_dates = filter_dates(expirations)
+        except ValueError as e:
+            return f"Options data issue: {str(e)}"
 
-        sess = get_http_session()
+        # Limit to first 5 expirations for performance
+        exp_dates = exp_dates[:5]
+        
+        # Fetch options chains with progress
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        options_data = {}
+        for i, exp_date in enumerate(exp_dates):
+            status_text.text(f"Fetching options chain {i+1}/{len(exp_dates)}...")
+            progress_bar.progress((i + 1) / len(exp_dates))
+            
+            chain_data = fetch_options_chain(ticker, exp_date)
+            if chain_data['success']:
+                options_data[exp_date] = chain_data
+            
+            # Small delay to avoid rate limiting
+            time.sleep(0.1)
+        
+        progress_bar.empty()
+        status_text.empty()
 
-        atm_iv: Dict[str, float] = {}
+        if not options_data:
+            return "Unable to fetch any options chains."
+
+        # Calculate ATM IV for each expiration
+        atm_iv = {}
         straddle = None
         first_done = False
 
-        for exp_date in exp_dates:
-            # compute unix for direct/yq even if not provided
-            exp_unix = exp_map_unix.get(exp_date, _epoch_from_date_str(exp_date))
-
-            calls = puts = pd.DataFrame()
-
-            # Try yfinance → direct → yq for the chain
-            for attempt in range(3):
-                try:
-                    calls, puts = fetch_chain_yf(t, exp_date, sess)
-                    if not (calls.empty or puts.empty): break
-                except Exception:
-                    time.sleep(0.2 + 0.2*attempt + random.random()*0.2)
-
+        for exp_date, chain_data in options_data.items():
+            calls = chain_data['calls']
+            puts = chain_data['puts']
+            
             if calls.empty or puts.empty:
-                for attempt in range(3):
+                continue
+
+            try:
+                # Find ATM options
+                call_diffs = (calls['strike'] - underlying_price).abs()
+                put_diffs = (puts['strike'] - underlying_price).abs()
+                
+                call_idx = call_diffs.idxmin()
+                put_idx = put_diffs.idxmin()
+
+                call_iv = float(calls.loc[call_idx, 'impliedVolatility'])
+                put_iv = float(puts.loc[put_idx, 'impliedVolatility'])
+                
+                # Basic sanity check
+                if call_iv <= 0 or put_iv <= 0 or call_iv > 10 or put_iv > 10:
+                    continue
+                    
+                atm_iv_value = (call_iv + put_iv) / 2.0
+                atm_iv[exp_date] = atm_iv_value
+
+                # Calculate straddle for first valid expiration
+                if not first_done:
                     try:
-                        calls, puts = fetch_chain_direct(t, exp_unix, sess)
-                        if not (calls.empty or puts.empty): break
-                    except Exception:
-                        time.sleep(0.3 + 0.2*attempt + random.random()*0.2)
+                        call_bid = calls.loc[call_idx, 'bid']
+                        call_ask = calls.loc[call_idx, 'ask']
+                        put_bid = puts.loc[put_idx, 'bid']
+                        put_ask = puts.loc[put_idx, 'ask']
 
-            if calls.empty or puts.empty:
-                calls, puts = fetch_chain_yq(t, exp_unix)
-
-            if calls.empty or puts.empty or "strike" not in calls.columns or "strike" not in puts.columns:
+                        if all(pd.notna([call_bid, call_ask, put_bid, put_ask])) and all(x > 0 for x in [call_bid, call_ask, put_bid, put_ask]):
+                            call_mid = (call_bid + call_ask) / 2.0
+                            put_mid = (put_bid + put_ask) / 2.0
+                            straddle = float(call_mid + put_mid)
+                            first_done = True
+                    except:
+                        pass
+                        
+            except Exception:
                 continue
-
-            def nearest_with_iv(df: pd.DataFrame):
-                if "impliedVolatility" not in df.columns:
-                    return None
-                df2 = df[pd.notna(df["impliedVolatility"])].copy()
-                if df2.empty:
-                    return None
-                df2["dist"] = (df2["strike"].astype(float) - float(price)).abs()
-                return df2.sort_values("dist").iloc[0]
-
-            call_row = nearest_with_iv(calls); put_row = nearest_with_iv(puts)
-            if call_row is None or put_row is None:
-                continue
-
-            atm_iv[exp_date] = (float(call_row["impliedVolatility"]) + float(put_row["impliedVolatility"])) / 2.0
-
-            if not first_done:
-                def mid(row):
-                    b = row.get("bid"); a = row.get("ask")
-                    return (float(b) + float(a)) / 2.0 if pd.notna(b) and pd.notna(a) else None
-                cm, pm = mid(call_row), mid(put_row)
-                if cm is not None and pm is not None:
-                    straddle = cm + pm
-                first_done = True
 
         if not atm_iv:
-            return "Error: Could not determine ATM IV for any expiration dates."
+            return "Unable to calculate ATM IV for any expiration dates."
 
         # Build term structure
-        today = datetime.now(timezone.utc).date()
+        today = datetime.today().date()
         dtes, ivs = [], []
+        
         for exp_date, iv in atm_iv.items():
-            ed = datetime.strptime(exp_date, "%Y-%m-%d").date()
-            dte = (ed - today).days
-            if dte > 0:
-                dtes.append(dte); ivs.append(iv)
-        if not dtes:
-            return "Error: Unable to compute DTEs."
+            try:
+                exp_date_obj = datetime.strptime(exp_date, "%Y-%m-%d").date()
+                days_to_expiry = (exp_date_obj - today).days
+                if days_to_expiry > 0:
+                    dtes.append(days_to_expiry)
+                    ivs.append(iv)
+            except:
+                continue
+
+        if len(dtes) < 2:
+            return "Insufficient options data for analysis."
 
         term_spline = build_term_structure(dtes, ivs)
-        d0 = min(dtes); d45 = 45
+
+        # Calculate term structure slope
+        d0 = min(dtes)
+        d45 = 45
         ts_slope_0_45 = 0.0 if d0 == d45 else (term_spline(d45) - term_spline(d0)) / (45 - d0)
 
-        # History for YZ (use 6mo for safety, 60 bars window)
-        px = yf.Ticker(t, session=sess).history(period='6mo', interval='1d', auto_adjust=True, prepost=False)
-        px = px.dropna(subset=['Open','High','Low','Close'])
-        if len(px) < 35:
-            return "Error: Not enough historical price data."
-        yz_vol_annual = float(yang_zhang(px.tail(60), window=30))
-        if not np.isfinite(yz_vol_annual) or yz_vol_annual <= 0:
-            return "Error: Realized volatility computation invalid."
-
-        iv30_rv30 = float(term_spline(30)) / yz_vol_annual
+        # Calculate Yang-Zhang volatility
         try:
-            avg_volume = px['Volume'].rolling(30).mean().dropna().iloc[-1]
-        except Exception:
-            avg_volume = np.nan
+            yz_vol_annual = yang_zhang(price_history)
+        except ValueError as e:
+            return f"Volatility calculation error: {str(e)}"
 
-        expected_move = f"{round((straddle or 0) / price * 100, 2)}%" if straddle else None
+        # IV/RV ratio
+        iv30 = term_spline(30)
+        iv30_rv30 = iv30 / yz_vol_annual
+
+        # Volume analysis
+        try:
+            recent_volume = price_history['Volume'].tail(30)
+            avg_volume = recent_volume.mean() if not recent_volume.empty else 0
+        except:
+            avg_volume = 0
+
+        # Expected move calculation
+        expected_move = None
+        if straddle:
+            expected_move = f"{round(straddle / underlying_price * 100, 2)}%"
 
         return {
-            'avg_volume': bool(avg_volume >= 1_500_000) if pd.notna(avg_volume) else False,
+            'success': True,
+            'avg_volume': bool(avg_volume >= 1_500_000),
             'iv30_rv30': float(iv30_rv30) >= 1.25,
             'ts_slope_0_45': float(ts_slope_0_45) <= -0.00406,
             'expected_move': expected_move,
-            'underlying_price': price,
+            'underlying_price': underlying_price,
             'atm_iv_points': pd.DataFrame({'DTE': dtes, 'ATM_IV': ivs}).sort_values('DTE').reset_index(drop=True),
+            'iv30_rv30_value': iv30_rv30,
+            'ts_slope_value': ts_slope_0_45,
+            'avg_volume_value': avg_volume
         }
+        
     except Exception as e:
-        return f"Error occurred processing. ({type(e).__name__}: {e})"
+        return f"Unexpected error: {str(e)}"
 
 # ============================ UI ============================
 
 st.title("📈 Earnings Position Checker")
 st.markdown(
-    "<a href='https://stocktwits.com/sentiment/calendar' target='_blank'>"
-    "🔗 Stocktwits Earnings Calendar ↗</a>",
+    "[![Stocktwits Earnings Calendar](https://img.shields.io/badge/📅-Stocktwits_Earnings_Calendar-blue)](https://stocktwits.com/sentiment/calendar)",
     unsafe_allow_html=True,
 )
-st.caption("Evaluates pre-earnings criteria from options term structure (ATM IV) and Yang–Zhang realized volatility.")
+st.caption("Evaluates pre-earnings criteria using options term structure (ATM IV) and Yang–Zhang realized volatility.")
 
-with st.expander("Read the disclaimer"):
-    st.write(__doc__)
+# Instructions
+with st.expander("📋 How to Use"):
+    st.markdown("""
+    1. **Enter a US stock ticker** (e.g., AAPL, MSFT, TSLA)
+    2. **Click "Run Analysis"** to fetch data and compute metrics
+    3. **Review the recommendation** based on three key criteria:
+       - **Volume**: 30-day average ≥ 1.5M shares
+       - **IV/RV Ratio**: 30-day implied/realized volatility ≥ 1.25
+       - **Term Structure**: Downward sloping (slope ≤ -0.00406)
+    
+    **Recommendations:**
+    - 🟢 **Recommended**: All 3 criteria met
+    - 🟡 **Consider**: Term structure + 1 other criteria
+    - 🔴 **Avoid**: Less than 2 criteria met
+    """)
 
-with st.sidebar:
-    if st.button("🔄 Clear cache"):
-        st.cache_data.clear()
-        st.success("Cache cleared. Re-run the check.")
+# Disclaimer
+with st.expander("⚠️ Important Disclaimer"):
+    st.warning("""
+    **EDUCATIONAL PURPOSE ONLY**
+    
+    This tool is for educational and research purposes only. It does not provide investment advice. 
+    The developers are not financial advisors and accept no responsibility for any financial decisions 
+    or losses. Always consult a professional financial advisor before making investment decisions.
+    """)
 
-ticker = st.text_input("Enter Stock Symbol", value="", placeholder="e.g., AAPL")
-run = st.button("Run Check", type="primary")
+# Input section
+col1, col2 = st.columns([3, 1])
+with col1:
+    ticker = st.text_input(
+        "Stock Symbol", 
+        value="", 
+        placeholder="e.g., AAPL, MSFT, TSLA",
+        help="Enter a US equity ticker symbol with listed options"
+    )
+with col2:
+    st.write("")  # Spacing
+    run = st.button("🔍 Run Analysis", type="primary", use_container_width=True)
 
 if run:
     if not ticker.strip():
-        st.warning("Please enter a stock symbol.")
+        st.warning("⚠️ Please enter a stock symbol.")
         st.stop()
 
-    with st.spinner("Fetching data and computing metrics..."):
+    with st.spinner("🔄 Analyzing options data... This may take 30-60 seconds."):
         result = compute_recommendation(ticker)
 
-    if isinstance(result, str):
-        st.error(result)
+    if isinstance(result, str) or not result.get('success', False):
+        error_msg = result if isinstance(result, str) else result.get('error', 'Unknown error')
+        st.error(f"❌ {error_msg}")
+        
+        # Suggestions for common issues
+        st.info("""
+        **Common issues:**
+        - Verify the ticker symbol is correct (US equities only)
+        - Some tickers may have limited options data
+        - Try again in a few moments if rate-limited
+        """)
         st.stop()
 
+    # Extract results
     avg_volume_bool = result['avg_volume']
-    iv30_rv30_bool  = result['iv30_rv30']
-    ts_slope_bool   = result['ts_slope_0_45']
-    expected_move   = result['expected_move']
-    price           = result['underlying_price']
-    atm_df          = result['atm_iv_points']
+    iv30_rv30_bool = result['iv30_rv30']
+    ts_slope_bool = result['ts_slope_0_45']
+    expected_move = result['expected_move']
+    price = result['underlying_price']
+    atm_df = result['atm_iv_points']
+    
+    # Additional metrics for display
+    iv30_rv30_value = result.get('iv30_rv30_value', 0)
+    ts_slope_value = result.get('ts_slope_value', 0)
+    avg_volume_value = result.get('avg_volume_value', 0)
 
-    if avg_volume_bool and iv30_rv30_bool and ts_slope_bool:
-        title, color = "Recommended", "#065f46"
-    elif ts_slope_bool and (avg_volume_bool ^ iv30_rv30_bool):
-        title, color = "Consider", "#92400e"
+    # Overall recommendation logic
+    criteria_met = sum([avg_volume_bool, iv30_rv30_bool, ts_slope_bool])
+    
+    if criteria_met == 3:
+        recommendation = "🟢 Recommended"
+        color = "#16a34a"
+        description = "All criteria met - favorable setup"
+    elif criteria_met == 2 and ts_slope_bool:
+        recommendation = "🟡 Consider"
+        color = "#ea580c"
+        description = "Term structure favorable with one additional criteria"
     else:
-        title, color = "Avoid", "#7f1d1d"
+        recommendation = "🔴 Avoid"
+        color = "#dc2626"
+        description = "Insufficient criteria met"
 
-    st.markdown(f"<h3 style='color:{color};margin-top:0.5rem'>{title}</h3>", unsafe_allow_html=True)
-    st.markdown(
-        f"**Ticker:** `{ticker.strip().upper().replace('.', '-')}`  |  **Last Price:** ${price:,.2f}"
-        + (f"  |  **Expected Move (nearest straddle):** {badge(expected_move)}" if expected_move else ""),
-        unsafe_allow_html=True,
-    )
+    # Display results
+    st.markdown(f"<h2 style='color:{color};margin-top:1rem'>{recommendation}</h2>", unsafe_allow_html=True)
+    st.caption(description)
 
-    for label, ok in [
-        ("avg_volume ≥ 1.5M (30-day avg)", avg_volume_bool),
-        ("IV30 / RV30 ≥ 1.25", iv30_rv30_bool),
-        ("Term slope (d0→45d) ≤ −0.00406", ts_slope_bool),
-    ]:
-        st.markdown(f"- {label}: {badge('PASS' if ok else 'FAIL', ok)}", unsafe_allow_html=True)
+    # Key metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Current Price", f"${price:,.2f}")
+    with col2:
+        if expected_move:
+            st.metric("Expected Move", expected_move)
+        else:
+            st.metric("Expected Move", "N/A")
+    with col3:
+        st.metric("Criteria Met", f"{criteria_met}/3")
 
+    # Detailed criteria
+    st.subheader("📊 Criteria Analysis")
+    
+    criteria_data = [
+        {
+            "Criterion": "Volume (30d avg ≥ 1.5M)",
+            "Status": "✅ PASS" if avg_volume_bool else "❌ FAIL",
+            "Value": f"{avg_volume_value:,.0f}",
+            "Target": "≥ 1,500,000"
+        },
+        {
+            "Criterion": "IV30/RV30 Ratio ≥ 1.25",
+            "Status": "✅ PASS" if iv30_rv30_bool else "❌ FAIL", 
+            "Value": f"{iv30_rv30_value:.2f}",
+            "Target": "≥ 1.25"
+        },
+        {
+            "Criterion": "Term Slope ≤ -0.00406",
+            "Status": "✅ PASS" if ts_slope_bool else "❌ FAIL",
+            "Value": f"{ts_slope_value:.5f}",
+            "Target": "≤ -0.00406"
+        }
+    ]
+    
+    criteria_df = pd.DataFrame(criteria_data)
+    st.dataframe(criteria_df, use_container_width=True, hide_index=True)
+
+    # Volatility term structure chart
     if not atm_df.empty:
-        st.subheader("ATM IV vs DTE")
+        st.subheader("📈 ATM Implied Volatility Term Structure")
+        
         chart_df = atm_df.copy()
         chart_df["ATM_IV_pct"] = chart_df["ATM_IV"] * 100
-        base = (
-            alt.Chart(chart_df).mark_line(point=True).encode(
-                x=alt.X("DTE:Q", title="Days to Expiration (DTE)"),
-                y=alt.Y("ATM_IV_pct:Q", title="ATM IV (%)"),
-                tooltip=[alt.Tooltip("DTE:Q", title="DTE"),
-                         alt.Tooltip("ATM_IV_pct:Q", title="ATM IV (%)", format=".2f")]
-            ).properties(width=700, height=420)
+
+        # Create base chart
+        base_chart = alt.Chart(chart_df).mark_line(
+            point=alt.OverlayMarkDef(filled=True, size=100),
+            strokeWidth=3,
+            color="#2563eb"
+        ).encode(
+            x=alt.X("DTE:Q", title="Days to Expiration"),
+            y=alt.Y("ATM_IV_pct:Q", title="ATM Implied Volatility (%)", scale=alt.Scale(zero=False)),
+            tooltip=[
+                alt.Tooltip("DTE:Q", title="DTE"),
+                alt.Tooltip("ATM_IV_pct:Q", title="ATM IV (%)", format=".2f")
+            ]
+        ).properties(
+            width=700,
+            height=400,
+            title="Implied Volatility Term Structure"
         )
-        overlay = []
+
+        # Add expected move line if available
+        layers = [base_chart]
         if expected_move:
             try:
-                overlay.append(
-                    alt.Chart(pd.DataFrame({"y": [float(expected_move.strip('%'))]}))
-                    .mark_rule(strokeDash=[5, 5]).encode(y="y:Q")
+                exp_val = float(expected_move.strip("%"))
+                rule_df = pd.DataFrame({"expected_move": [exp_val]})
+                
+                exp_move_line = alt.Chart(rule_df).mark_rule(
+                    strokeDash=[5, 5],
+                    strokeWidth=2,
+                    color="#dc2626"
+                ).encode(
+                    y=alt.Y("expected_move:Q"),
+                    tooltip=alt.value(f"Expected Move: {expected_move}")
                 )
-            except Exception:
+                layers.append(exp_move_line)
+                
+            except:
                 pass
-        st.altair_chart(alt.layer(base, *overlay).properties(
-            title="ATM Implied Volatility Term Structure"
-        ), use_container_width=True)
-        st.download_button("Download ATM IV points (CSV)",
-                           chart_df[["DTE", "ATM_IV"]].to_csv(index=False),
-                           file_name="atm_iv_points.csv")
 
-st.caption("Data source: Yahoo Finance (yfinance / query2 API / yahooquery). Data may be delayed.")
-st.caption("Created by Shashank Agarwal")
+        final_chart = alt.layer(*layers).resolve_scale(y='independent')
+        st.altair_chart(final_chart, use_container_width=True)
+
+    # Additional information
+    with st.expander("ℹ️ Methodology & Notes"):
+        st.markdown("""
+        **Data Sources:** Yahoo Finance (may have delays)
+        
+        **Calculations:**
+        - **ATM IV**: Average of call and put implied volatilities at nearest-to-money strikes
+        - **Yang-Zhang RV**: 30-day realized volatility using Yang-Zhang estimator  
+        - **Term Structure Slope**: Linear slope from nearest expiry to 45-day interpolated IV
+        - **Expected Move**: Straddle price as percentage of underlying (nearest expiry)
+        
+        **Limitations:**
+        - Data may be delayed or incomplete
+        - Options with low volume may have unreliable pricing
+        - Analysis is point-in-time and market conditions change rapidly
+        """)
+
+    # Footer
+    st.markdown("---")
+    st.caption("⚠️ For educational purposes only. Not investment advice.")
+    
+    # Success message
+    st.success(f"✅ Analysis completed for {ticker.upper()}")
+
+else:
+    # Show example when not running
+    st.markdown("---")
+    st.markdown("**💡 Try these popular tickers:** `AAPL`, `MSFT`, `GOOGL`, `TSLA`, `AMZN`, `NVDA`")
+    
+    # Sample output preview
+    with st.expander("👀 Preview: Sample Analysis Results"):
+        st.image("https://via.placeholder.com/600x300/f0f0f0/666666?text=Sample+Volatility+Chart", caption="Example: ATM IV Term Structure")
+        
+        sample_df = pd.DataFrame({
+            "Criterion": ["Volume ≥ 1.5M", "IV/RV ≥ 1.25", "Term Slope ≤ -0.00406"],
+            "Status": ["✅ PASS", "✅ PASS", "❌ FAIL"],
+            "Value": ["2,450,000", "1.32", "0.00123"],
+            "Target": ["≥ 1,500,000", "≥ 1.25", "≤ -0.00406"]
+        })
+        st.dataframe(sample_df, use_container_width=True, hide_index=True)
