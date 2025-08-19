@@ -7,8 +7,9 @@ The developers are not financial advisors and accept no responsibility for any f
 Always consult a professional financial advisor before making any investment decisions.
 """
 
-import time
 from typing import Optional, List
+import time
+from json import JSONDecodeError
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,8 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from scipy.interpolate import interp1d
 import altair as alt
+import requests
+from requests.exceptions import RequestException, Timeout, ConnectionError as ReqConnectionError
 
 st.set_page_config(page_title="Earnings Position Checker", page_icon="📈", layout="centered")
 
@@ -114,27 +117,49 @@ def get_current_price(ticker_obj: yf.Ticker) -> Optional[float]:
         return None
     return float(todays['Close'].iloc[-1])
 
+# ============================ Session management (fixes JSONDecodeError) ============================
+
+def _new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    })
+    return s
+
+@st.cache_resource(ttl=900)
+def get_http_session() -> requests.Session:
+    """Cached HTTP session with browser-like headers."""
+    return _new_session()
+
 # ---------- Robust Yahoo fetchers with retries ----------
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_expirations_and_price(ticker: str):
     """
-    Return (expirations, price, error_message). On failure, error_message is a non-empty string.
-    Retries a few times to handle transient Yahoo issues on Cloud.
+    Return (expirations, price, error_message). On failure, error_message is non-empty.
+    First try with a cached session; on errors (incl. JSONDecodeError), retry with a fresh session.
     """
     err = None
     expirations, price = [], None
 
     for attempt in range(4):
         try:
-            t = yf.Ticker(ticker)
+            session = get_http_session() if attempt == 0 else _new_session()
+            t = yf.Ticker(ticker, session=session)
+
             expirations = list(t.options or [])
             price = get_current_price(t)
+            if not expirations or price is None:
+                raise ValueError("Empty options or price")
             err = None
             break
-        except Exception as e:
+        except (JSONDecodeError, ReqConnectionError, Timeout, RequestException, ValueError) as e:
             err = f"{type(e).__name__}: {e}"
-            time.sleep(0.7 * (attempt + 1))  # backoff
+            time.sleep(0.8 * (attempt + 1))  # small backoff
 
     return expirations, price, err
 
@@ -157,7 +182,7 @@ def _safe_option_chain(stock: yf.Ticker, exp_date: str):
 
 def compute_recommendation(ticker: str):
     try:
-        ticker = ticker.strip().upper()
+        ticker = ticker.strip().upper().replace(".", "-")
         if not ticker:
             return "No stock symbol provided."
 
@@ -175,17 +200,17 @@ def compute_recommendation(ticker: str):
         except Exception:
             return "Error: Not enough option data."
 
-        # Recreate Ticker for chains (avoid caching a complex object)
-        stock = yf.Ticker(ticker)
+        # Use a session for all subsequent Yahoo calls
+        session = get_http_session()
+        stock = yf.Ticker(ticker, session=session)
 
         atm_iv = {}
         straddle = None
         first_done = False
 
         for exp_date in exp_dates:
-            chain, ch_err = _safe_option_chain(stock, exp_date)
+            chain, _ = _safe_option_chain(stock, exp_date)
             if chain is None:
-                # Skip silently; we still might have other expiries
                 continue
 
             calls = getattr(chain, "calls", pd.DataFrame())
@@ -247,15 +272,14 @@ def compute_recommendation(ticker: str):
         d45 = 45
         ts_slope_0_45 = 0.0 if d0 == d45 else (term_spline(d45) - term_spline(d0)) / (45 - d0)
 
-        # Historical prices for Yang–Zhang
-        price_history = stock.history(period='3mo', interval='1d', auto_adjust=False, prepost=False)
-        if price_history.empty:
-            price_history = stock.history(period='6mo', interval='1d', auto_adjust=False, prepost=False)
-        if price_history.empty:
+        # Historical prices (fetch longer, compute on latest slice)
+        px = stock.history(period='6mo', interval='1d', auto_adjust=True, prepost=False)
+        px = px.dropna(subset=['Open', 'High', 'Low', 'Close'])
+        if len(px) < 35:
             return "Error: Not enough historical price data."
 
         try:
-            yz_vol_annual = float(yang_zhang(price_history))
+            yz_vol_annual = float(yang_zhang(px.tail(60), window=30))
             if not np.isfinite(yz_vol_annual) or yz_vol_annual <= 0:
                 return "Error: Realized volatility computation invalid."
         except Exception as e:
@@ -265,7 +289,7 @@ def compute_recommendation(ticker: str):
 
         # Liquidity proxy
         try:
-            avg_volume = price_history['Volume'].rolling(30).mean().dropna().iloc[-1]
+            avg_volume = px['Volume'].rolling(30).mean().dropna().iloc[-1]
         except Exception:
             avg_volume = np.nan
 
@@ -296,6 +320,11 @@ st.caption("Evaluates pre-earnings criteria from options term structure (ATM IV)
 with st.expander("Read the disclaimer"):
     st.write(__doc__)
 
+with st.sidebar:
+    if st.button("🔄 Clear cache"):
+        st.cache_data.clear()
+        st.success("Cache cleared. Re-run the check.")
+
 ticker = st.text_input("Enter Stock Symbol", value="", placeholder="e.g., AAPL", help="US equity ticker with listed options")
 run = st.button("Run Check", type="primary")
 
@@ -308,7 +337,6 @@ if run:
         result = compute_recommendation(ticker)
 
     if isinstance(result, str):
-        # Show the specific reason now
         st.error(result)
         st.stop()
 
@@ -332,7 +360,7 @@ if run:
 
     st.markdown(f"<h3 style='color:{color};margin-top:0.5rem'>{title}</h3>", unsafe_allow_html=True)
     st.markdown(
-        f"**Ticker:** `{ticker.upper()}`  |  **Last Price:** ${price:,.2f}"
+        f"**Ticker:** `{ticker.strip().upper().replace('.', '-')}`  |  **Last Price:** ${price:,.2f}"
         + (f"  |  **Expected Move (nearest straddle):** {badge(expected_move)}" if expected_move else ""),
         unsafe_allow_html=True,
     )
@@ -359,7 +387,10 @@ if run:
             .encode(
                 x=alt.X("DTE:Q", title="Days to Expiration (DTE)"),
                 y=alt.Y("ATM_IV_pct:Q", title="ATM IV (%)"),
-                tooltip=[alt.Tooltip("DTE:Q", title="DTE"), alt.Tooltip("ATM_IV_pct:Q", title="ATM IV (%)", format=".2f")]
+                tooltip=[
+                    alt.Tooltip("DTE:Q", title="DTE"),
+                    alt.Tooltip("ATM_IV_pct:Q", title="ATM IV (%)", format=".2f")
+                ]
             )
             .properties(width=700, height=420)
         )
@@ -382,6 +413,10 @@ if run:
             title=f"ATM Implied Volatility Term Structure{title_suffix}"
         )
         st.altair_chart(chart, use_container_width=True)
+
+        st.download_button("Download ATM IV points (CSV)",
+                           chart_df[["DTE", "ATM_IV"]].to_csv(index=False),
+                           file_name="atm_iv_points.csv")
 
     st.info(
         "Notes:\n"
