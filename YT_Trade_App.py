@@ -7,13 +7,15 @@ The developers are not financial advisors and accept no responsibility for any f
 Always consult a professional financial advisor before making any investment decisions.
 """
 
-import streamlit as st
-import yfinance as yf
+import time
+from typing import Optional, List
+
 import numpy as np
 import pandas as pd
+import streamlit as st
+import yfinance as yf
 from datetime import datetime, timedelta
 from scipy.interpolate import interp1d
-from typing import Optional, List
 import altair as alt
 
 st.set_page_config(page_title="Earnings Position Checker", page_icon="📈", layout="centered")
@@ -107,18 +109,51 @@ def get_current_price(ticker_obj: yf.Ticker) -> Optional[float]:
             return float(px)
     except Exception:
         pass
-    todays = ticker_obj.history(period='1d')
+    todays = ticker_obj.history(period='1d', interval='1d', auto_adjust=False, prepost=False)
     if len(todays) == 0:
         return None
     return float(todays['Close'].iloc[-1])
 
+# ---------- Robust Yahoo fetchers with retries ----------
+
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_expirations_and_price(ticker: str):
-    """Cache ONLY simple data (not the Ticker object)."""
-    t = yf.Ticker(ticker)
-    expirations = list(t.options or [])
-    price = get_current_price(t)
-    return expirations, price
+    """
+    Return (expirations, price, error_message). On failure, error_message is a non-empty string.
+    Retries a few times to handle transient Yahoo issues on Cloud.
+    """
+    err = None
+    expirations, price = [], None
+
+    for attempt in range(4):
+        try:
+            t = yf.Ticker(ticker)
+            expirations = list(t.options or [])
+            price = get_current_price(t)
+            err = None
+            break
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            time.sleep(0.7 * (attempt + 1))  # backoff
+
+    return expirations, price, err
+
+def _safe_option_chain(stock: yf.Ticker, exp_date: str):
+    """
+    Try a few times to fetch an option chain for a given expiry.
+    Returns (chain, error_msg). chain has .calls and .puts or is None.
+    """
+    last_err = None
+    for attempt in range(3):
+        try:
+            ch = stock.option_chain(exp_date)
+            return ch, None
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            time.sleep(0.5 * (attempt + 1))
+    return None, last_err
+
+# ---------- Main computation ----------
 
 def compute_recommendation(ticker: str):
     try:
@@ -126,59 +161,68 @@ def compute_recommendation(ticker: str):
         if not ticker:
             return "No stock symbol provided."
 
-        expirations, underlying_price = fetch_expirations_and_price(ticker)
+        expirations, underlying_price, yf_err = fetch_expirations_and_price(ticker)
+        if yf_err:
+            return f"Yahoo data request failed. Please try again shortly. ({yf_err})"
         if not expirations:
             return f"Error: No options found for stock symbol '{ticker}'."
         if not underlying_price:
             return "Error: Unable to retrieve underlying stock price."
 
+        # Choose expiries (nearest → ≥45d window)
         try:
             exp_dates = filter_dates(expirations)
         except Exception:
             return "Error: Not enough option data."
 
-        # Recreate Ticker for chains (don’t use cached object)
+        # Recreate Ticker for chains (avoid caching a complex object)
         stock = yf.Ticker(ticker)
-
-        options_chains = {}
-        for exp_date in exp_dates:
-            try:
-                options_chains[exp_date] = stock.option_chain(exp_date)
-            except Exception:
-                continue
 
         atm_iv = {}
         straddle = None
         first_done = False
 
-        for exp_date, chain in options_chains.items():
-            calls = getattr(chain, "calls", pd.DataFrame())
-            puts  = getattr(chain, "puts",  pd.DataFrame())
-            if calls.empty or puts.empty:
+        for exp_date in exp_dates:
+            chain, ch_err = _safe_option_chain(stock, exp_date)
+            if chain is None:
+                # Skip silently; we still might have other expiries
                 continue
 
-            # ATM IV via nearest strikes
-            call_diffs = (calls['strike'] - underlying_price).abs()
-            put_diffs  = (puts['strike']  - underlying_price).abs()
-            call_idx   = call_diffs.idxmin()
-            put_idx    = put_diffs.idxmin()
+            calls = getattr(chain, "calls", pd.DataFrame())
+            puts  = getattr(chain, "puts",  pd.DataFrame())
+            if calls.empty or puts.empty or "strike" not in calls or "strike" not in puts:
+                continue
 
-            call_iv = float(calls.loc[call_idx, 'impliedVolatility'])
-            put_iv  = float(puts.loc[put_idx,  'impliedVolatility'])
+            # Pick nearest strike with non-NaN IV for each side
+            def _nearest_with_iv(df):
+                df2 = df.copy()
+                df2 = df2[pd.notna(df2.get("impliedVolatility"))]
+                if df2.empty:
+                    return None
+                df2["dist"] = (df2["strike"] - underlying_price).abs()
+                return df2.sort_values("dist").iloc[0]
+
+            call_row = _nearest_with_iv(calls)
+            put_row  = _nearest_with_iv(puts)
+            if call_row is None or put_row is None:
+                continue
+
+            call_iv = float(call_row["impliedVolatility"])
+            put_iv  = float(put_row["impliedVolatility"])
             atm_iv_value = (call_iv + put_iv) / 2.0
             atm_iv[exp_date] = atm_iv_value
 
-            # First expiry: straddle mid for expected move
+            # Nearest expiry: compute straddle mid for expected move (if quotes exist)
             if not first_done:
-                call_bid = calls.loc[call_idx, 'bid']
-                call_ask = calls.loc[call_idx, 'ask']
-                put_bid  = puts.loc[put_idx,  'bid']
-                put_ask  = puts.loc[put_idx,  'ask']
-
-                call_mid = (call_bid + call_ask) / 2.0 if pd.notna(call_bid) and pd.notna(call_ask) else None
-                put_mid  = (put_bid  + put_ask)  / 2.0 if pd.notna(put_bid)  and pd.notna(put_ask)  else None
+                def _mid(row, bid_col="bid", ask_col="ask"):
+                    b, a = row.get(bid_col), row.get(ask_col)
+                    if pd.notna(b) and pd.notna(a):
+                        return (float(b) + float(a)) / 2.0
+                    return None
+                call_mid = _mid(call_row)
+                put_mid  = _mid(put_row)
                 if call_mid is not None and put_mid is not None:
-                    straddle = float(call_mid + put_mid)
+                    straddle = call_mid + put_mid
                 first_done = True
 
         if not atm_iv:
@@ -204,16 +248,20 @@ def compute_recommendation(ticker: str):
         ts_slope_0_45 = 0.0 if d0 == d45 else (term_spline(d45) - term_spline(d0)) / (45 - d0)
 
         # Historical prices for Yang–Zhang
-        price_history = stock.history(period='3mo')
+        price_history = stock.history(period='3mo', interval='1d', auto_adjust=False, prepost=False)
+        if price_history.empty:
+            price_history = stock.history(period='6mo', interval='1d', auto_adjust=False, prepost=False)
         if price_history.empty:
             return "Error: Not enough historical price data."
 
         try:
-            yz_vol_annual = yang_zhang(price_history)
-        except Exception:
-            return "Error: Failed to compute realized volatility."
+            yz_vol_annual = float(yang_zhang(price_history))
+            if not np.isfinite(yz_vol_annual) or yz_vol_annual <= 0:
+                return "Error: Realized volatility computation invalid."
+        except Exception as e:
+            return f"Error: Failed to compute realized volatility. ({type(e).__name__}: {e})"
 
-        iv30_rv30 = term_spline(30) / yz_vol_annual
+        iv30_rv30 = float(term_spline(30)) / yz_vol_annual
 
         # Liquidity proxy
         try:
@@ -231,8 +279,9 @@ def compute_recommendation(ticker: str):
             'underlying_price': underlying_price,
             'atm_iv_points': pd.DataFrame({'DTE': dtes, 'ATM_IV': ivs}).sort_values('DTE').reset_index(drop=True),
         }
-    except Exception:
-        return "Error occurred processing."
+    except Exception as e:
+        # Last-resort message with details so users aren't stuck with a generic error
+        return f"Error occurred processing. ({type(e).__name__}: {e})"
 
 # ============================ UI ============================
 
@@ -259,6 +308,7 @@ if run:
         result = compute_recommendation(ticker)
 
     if isinstance(result, str):
+        # Show the specific reason now
         st.error(result)
         st.stop()
 
